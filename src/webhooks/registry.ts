@@ -78,6 +78,19 @@ interface RegistryInterface {
   ): Promise<void>;
 
   /**
+   * Processes the webhook request without expectation for a still readable 
+   * request data. Instead already read body is passed along.
+   * @param reqBody Request body that was read
+   * @param request HTTP request received from Shopify
+   * @param response HTTP response to the request
+   */
+   processRaw(
+    reqBody: string,
+    request: http.IncomingMessage,
+    response: http.ServerResponse,
+  ): Promise<void>;
+
+  /**
    * Confirms that the given path is a webhook path
    *
    * @param string path component of a URI
@@ -333,6 +346,95 @@ const WebhooksRegistry: RegistryInterface = {
     return registerReturn;
   },
 
+  async processRaw(
+    reqBody: string,
+    request: http.IncomingMessage,
+    response: http.ServerResponse,
+  ): Promise<void> {
+    let hmac: string | string[] | undefined;
+    let topic: string | string[] | undefined;
+    let domain: string | string[] | undefined;
+    Object.entries(request.headers).map(([header, value]) => {
+      switch (header.toLowerCase()) {
+        case ShopifyHeader.Hmac.toLowerCase():
+          hmac = value;
+          break;
+        case ShopifyHeader.Topic.toLowerCase():
+          topic = value;
+          break;
+        case ShopifyHeader.Domain.toLowerCase():
+          domain = value;
+          break;
+      }
+    });
+
+    const missingHeaders = [];
+    if (!hmac) {
+      missingHeaders.push(ShopifyHeader.Hmac);
+    }
+    if (!topic) {
+      missingHeaders.push(ShopifyHeader.Topic);
+    }
+    if (!domain) {
+      missingHeaders.push(ShopifyHeader.Domain);
+    }
+
+    if (missingHeaders.length) {
+      response.writeHead(StatusCode.BadRequest);
+      response.end();
+      throw new ShopifyErrors.InvalidWebhookError(
+        `Missing one or more of the required HTTP headers to process webhooks: [${missingHeaders.join(
+          ', ',
+        )}]`,
+      )
+    }
+
+    let statusCode: StatusCode | undefined;
+    let responseError: Error | undefined;
+    const headers = {};
+
+    const generatedHash = createHmac('sha256', Context.API_SECRET_KEY)
+      .update(reqBody, 'utf8')
+      .digest('base64');
+
+    if (ShopifyUtilities.safeCompare(generatedHash, hmac as string)) {
+      const graphqlTopic = (topic as string)
+        .toUpperCase()
+        .replace(/\//g, '_');
+      const webhookEntry = WebhooksRegistry.getHandler(graphqlTopic);
+
+      if (webhookEntry) {
+        try {
+          await webhookEntry.webhookHandler(
+            graphqlTopic,
+            domain as string,
+            reqBody,
+          );
+          statusCode = StatusCode.Ok;
+        } catch (error) {
+          statusCode = StatusCode.InternalServerError;
+          responseError = error;
+        }
+      } else {
+        statusCode = StatusCode.Forbidden;
+        responseError = new ShopifyErrors.InvalidWebhookError(
+          `No webhook is registered for topic ${topic}`,
+        );
+      }
+    } else {
+      statusCode = StatusCode.Forbidden;
+      responseError = new ShopifyErrors.InvalidWebhookError(
+        `Could not validate request for topic ${topic}`,
+      );
+    }
+
+    response.writeHead(statusCode, headers);
+    response.end();
+    if (responseError) {
+      throw responseError;
+    }
+  },
+
   async process(
     request: http.IncomingMessage,
     response: http.ServerResponse,
@@ -355,92 +457,7 @@ const WebhooksRegistry: RegistryInterface = {
           );
         }
 
-        let hmac: string | string[] | undefined;
-        let topic: string | string[] | undefined;
-        let domain: string | string[] | undefined;
-        Object.entries(request.headers).map(([header, value]) => {
-          switch (header.toLowerCase()) {
-            case ShopifyHeader.Hmac.toLowerCase():
-              hmac = value;
-              break;
-            case ShopifyHeader.Topic.toLowerCase():
-              topic = value;
-              break;
-            case ShopifyHeader.Domain.toLowerCase():
-              domain = value;
-              break;
-          }
-        });
-
-        const missingHeaders = [];
-        if (!hmac) {
-          missingHeaders.push(ShopifyHeader.Hmac);
-        }
-        if (!topic) {
-          missingHeaders.push(ShopifyHeader.Topic);
-        }
-        if (!domain) {
-          missingHeaders.push(ShopifyHeader.Domain);
-        }
-
-        if (missingHeaders.length) {
-          response.writeHead(StatusCode.BadRequest);
-          response.end();
-          return reject(
-            new ShopifyErrors.InvalidWebhookError(
-              `Missing one or more of the required HTTP headers to process webhooks: [${missingHeaders.join(
-                ', ',
-              )}]`,
-            ),
-          );
-        }
-
-        let statusCode: StatusCode | undefined;
-        let responseError: Error | undefined;
-        const headers = {};
-
-        const generatedHash = createHmac('sha256', Context.API_SECRET_KEY)
-          .update(reqBody, 'utf8')
-          .digest('base64');
-
-        if (ShopifyUtilities.safeCompare(generatedHash, hmac as string)) {
-          const graphqlTopic = (topic as string)
-            .toUpperCase()
-            .replace(/\//g, '_');
-          const webhookEntry = WebhooksRegistry.getHandler(graphqlTopic);
-
-          if (webhookEntry) {
-            try {
-              await webhookEntry.webhookHandler(
-                graphqlTopic,
-                domain as string,
-                reqBody,
-              );
-              statusCode = StatusCode.Ok;
-            } catch (error) {
-              statusCode = StatusCode.InternalServerError;
-              responseError = error;
-            }
-          } else {
-            statusCode = StatusCode.Forbidden;
-            responseError = new ShopifyErrors.InvalidWebhookError(
-              `No webhook is registered for topic ${topic}`,
-            );
-          }
-        } else {
-          statusCode = StatusCode.Forbidden;
-          responseError = new ShopifyErrors.InvalidWebhookError(
-            `Could not validate request for topic ${topic}`,
-          );
-        }
-
-        response.writeHead(statusCode, headers);
-        response.end();
-        if (responseError) {
-          return reject(responseError);
-        } else {
-          return resolve();
-        }
+        resolve(this.processRaw(reqBody, request, response))
       });
     });
 
